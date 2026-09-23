@@ -59,15 +59,17 @@ def get_encounter_stats(replays):
         stats = EncounterStats()
         for i, player in enumerate(players):
             pid = get_pid(player)
+            if not pid:
+                continue
             own_stats = player_stats.setdefault(pid, EncounterStats())
-            platform = player.get("id", {}).get("platform")
+            platform = (player.get("id") or {}).get("platform")
             if platform == "steam":
                 stats.steam_count += 1
                 own_stats.steam_count += 1
                 if player.get("pro", False):
                     stats.pro_count += 1
                     own_stats.pro_count += 1
-            rank = player.get("rank", {}).get("id")
+            rank = (player.get("rank") or {}).get("id")
             if rank not in (None, bc.Rank.UNRANKED):
                 stats.ranked_count += 1
                 own_stats.ranked_count += 1
@@ -77,6 +79,8 @@ def get_encounter_stats(replays):
 
         for player in players:
             pid = get_pid(player)
+            if not pid:
+                continue
             encounter_stats[pid] = encounter_stats.get(pid, EncounterStats()) + stats
 
     return encounter_stats, player_stats, player_infos

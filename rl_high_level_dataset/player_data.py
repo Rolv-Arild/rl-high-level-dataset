@@ -1,6 +1,7 @@
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Optional
 
 import ballchasing as bc
 from ballchasing.util import from_rfc3339, get_scoreline, TEAMS, get_pid
@@ -10,13 +11,13 @@ from ballchasing.util import from_rfc3339, get_scoreline, TEAMS, get_pid
 class BasePlayerInfo:
     id: str = ""
     names: Counter = field(default_factory=Counter)
-    first_appearance: datetime = field(default=None)
-    latest_appearance: datetime = field(default=None)
+    first_appearance: Optional[datetime] = field(default=None)
+    latest_appearance: Optional[datetime] = field(default=None)
     has_liquipedia_page: bool = False
     wins: int = 0
     losses: int = 0
 
-    def update_appearances(self, dt):
+    def update_appearances(self, dt: datetime):
         """
         Updates the first and latest appearance dates for the player.
         If first_appearance is None, sets it to the current date.
@@ -53,12 +54,14 @@ class RankedPlayerInfo(BasePlayerInfo):
     @property
     def max_rank(self) -> str:
         """Returns the highest rank achieved by this player."""
-        return max(self.ranks, key=bc.Rank.ALL.index, default="Unranked")
+        valid_ranks = [r for r in self.ranks if r in bc.Rank.ALL]
+        return max(valid_ranks, key=bc.Rank.ALL.index, default="Unranked")
 
     @property
     def min_rank(self) -> str:
         """Returns the lowest rank achieved by this player."""
-        return min(self.ranks, key=bc.Rank.ALL.index, default="Unranked")
+        valid_ranks = [r for r in self.ranks if r in bc.Rank.ALL]
+        return min(valid_ranks, key=bc.Rank.ALL.index, default="Unranked")
 
 
 def update_player_infos(pinfos: dict, replay: dict):
@@ -69,7 +72,9 @@ def update_player_infos(pinfos: dict, replay: dict):
         players = replay.get(team, {}).get("players", [])
         for player in players:
             pid = get_pid(player)
-            rank = player.get("rank", {}).get("id")
+            if not pid:
+                continue
+            rank = (player.get("rank") or {}).get("id")
             if rank == bc.Rank.GRAND_CHAMPION_LEGACY:
                 rank = bc.Rank.GRAND_CHAMPION_1
 
@@ -78,10 +83,7 @@ def update_player_infos(pinfos: dict, replay: dict):
             pinfo.names[player.get("name", "")] += 1
             if rank is not None:
                 pinfo.ranks[rank] += 1
-            if pinfo.first_appearance is None or date < pinfo.first_appearance:
-                pinfo.first_appearance = date
-            if pinfo.latest_appearance is None or date > pinfo.latest_appearance:
-                pinfo.latest_appearance = date
+            pinfo.update_appearances(date)
             if player.get("pro", False):
                 pinfo.has_liquipedia_page = True
             if won:

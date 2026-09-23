@@ -145,21 +145,15 @@ wheels = [
 ]
 
 [[package]]
-name = "logging"
-version = "0.4.9.6"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/93/4b/979db9e44be09f71e85c9c8cfc42f258adfb7d93ce01deed2788b2948919/logging-0.4.9.6.tar.gz", hash = "sha256:26f6b50773f085042d301085bd1bf5d9f3735704db9f37c1ce6d8b85c38f2417", size = 96029, upload-time = "2013-06-04T23:43:22.086Z" }
-
-[[package]]
 name = "python-ballchasing"
-version = "0.5.1"
+version = "0.5.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "requests" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/6f/64/24a83fccd73f7df73d4d747f7c56f0f41eb246de59b9e0e4037c61fe42ed/python_ballchasing-0.5.1.tar.gz", hash = "sha256:a0510ef1e094c0b715b287afacbed71e8f84e146531bc01b55c53be62d19077b", size = 31122, upload-time = "2026-09-22T10:30:12.443Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/25/05/03755a6bee6e377409660328541d9a33a2685826740bd29194711b3774e2/python_ballchasing-0.5.4.tar.gz", hash = "sha256:47e809c3c1b6e53568b509c5a33eb93b2ec645e468107fc7253f2e8c90bdc066", size = 39375, upload-time = "2026-09-23T13:03:59.227Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/53/75/35dcd6c8925d15515847f1b0d0132d2d49d8cb32df09179c4512fc6e6423/python_ballchasing-0.5.1-py3-none-any.whl", hash = "sha256:82bc3d409e7037b036185b3137d102a194d24893f8129ef8437355dbb90947ff", size = 36165, upload-time = "2026-09-22T10:30:10.7Z" },
+    { url = "https://files.pythonhosted.org/packages/19/c9/550fc493faf1ce9e55e3e3838cf859845b92edd53de58cf37d51daa5fb39/python_ballchasing-0.5.4-py3-none-any.whl", hash = "sha256:1e701cddeb8d2cffb51889ccc2507ca73e9eccc00a7892cb8fbf5130458819d8", size = 44901, upload-time = "2026-09-23T13:03:57.791Z" },
 ]
 
 [[package]]
@@ -182,7 +176,6 @@ name = "rl-high-level-dataset"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
-    { name = "logging" },
     { name = "python-ballchasing" },
     { name = "requests" },
     { name = "tqdm" },
@@ -190,8 +183,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "logging", specifier = ">=0.4.9.6" },
-    { name = "python-ballchasing", specifier = ">=0.5.1" },
+    { name = "python-ballchasing", specifier = ">=0.5.4" },
     { name = "requests", specifier = ">=2.34.2" },
     { name = "tqdm", specifier = ">=4.70.1" },
 ]

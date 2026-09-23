@@ -2,6 +2,7 @@ import logging
 import os
 import time
 import warnings
+from pathlib import Path
 
 import requests
 
@@ -23,7 +24,7 @@ WHOSBOTTING_PLATFORM_MAP = {
 }
 
 
-def send_to_whosbotting(replay_path):
+def send_to_whosbotting(replay_path: str | Path | os.PathLike, max_retries: int = 5, timeout: float = 30.0):
     """Sends a replay file to whosbotting.com for ML-based bot detection."""
     headers = {"Content-Type": "application/replay"}
     if RATE_LIMIT_BYPASS_KEY:
@@ -32,27 +33,47 @@ def send_to_whosbotting(replay_path):
     with open(replay_path, "rb") as f:
         data = f.read()
 
-    response = requests.post(WHOSBOTTING_URL + WHOSBOTTING_ENDPOINT, data=data, headers=headers)
-    if response.status_code == 200:
-        return response.json()
-    elif response.status_code == 429:
+    retries = 0
+    while True:
         try:
-            t = int(response.headers.get("retry_after", 10))
-        except (ValueError, TypeError):
-            t = 10
-        logging.info(f"  Rate limited by whosbotting.com, waiting {t}s...")
-        time.sleep(t)
-        return send_to_whosbotting(replay_path)  # Retry
-    else:
-        logging.warning(f"  whosbotting.com error: {response.status_code} - {response.text[:200]}")
-        return None
+            response = requests.post(
+                WHOSBOTTING_URL + WHOSBOTTING_ENDPOINT,
+                data=data,
+                headers=headers,
+                timeout=timeout,
+            )
+            if response.status_code == 200:
+                return response.json()
+            elif response.status_code == 429:
+                retries += 1
+                if retries > max_retries:
+                    logging.warning(f"  whosbotting.com rate limit retries exceeded ({max_retries})")
+                    return None
+                retry_header = response.headers.get("Retry-After") or response.headers.get("retry_after", 10)
+                try:
+                    t = int(retry_header)
+                except (ValueError, TypeError):
+                    t = 10
+                logging.info(f"  Rate limited by whosbotting.com, waiting {t}s (retry {retries}/{max_retries})...")
+                time.sleep(t)
+            else:
+                logging.warning(f"  whosbotting.com error: {response.status_code} - {response.text[:200]}")
+                return None
+        except requests.RequestException as e:
+            retries += 1
+            if retries > max_retries:
+                logging.warning(f"  whosbotting.com request failed after {max_retries} retries: {e}")
+                return None
+            s = 2 ** retries
+            logging.info(f"  whosbotting.com connection error ({e}), retrying in {s}s...")
+            time.sleep(s)
 
 
-def has_cheater(replay_path):
+def has_cheater(replay_path: str | Path | os.PathLike) -> bool:
     whosbotting_verdict = send_to_whosbotting(replay_path)
-    if whosbotting_verdict is None:
+    if not whosbotting_verdict or not isinstance(whosbotting_verdict, dict):
         return False
-    for player_result in whosbotting_verdict["player_results"]:
-        if player_result["confidence_percent"] >= 0.5:
+    for player_result in whosbotting_verdict.get("player_results", []):
+        if player_result.get("confidence_percent", 0.0) >= 0.5:
             return True
     return False
