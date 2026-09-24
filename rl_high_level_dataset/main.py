@@ -22,7 +22,11 @@ from requests.adapters import HTTPAdapter
 from tqdm import tqdm
 
 from rl_high_level_dataset.encounters import get_encounter_stats, EncounterStats
-from rl_high_level_dataset.whosbotting import has_cheater
+from rl_high_level_dataset.whosbotting import (
+    has_cheater,
+    load_whosbotting_cache,
+    check_cached_cheater,
+)
 
 REPLAYS_PER_SEASON = int(os.getenv("REPLAYS_PER_SEASON", "100_000_000"))
 DEFAULT_SORT_BY = bc.ReplaySortBy.REPLAY_DATE
@@ -359,6 +363,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-dir", type=str, default=os.path.join(cur_path, "..", "out", "high_level"))
     parser.add_argument("--cache-dir", type=str, default=None)
+    parser.add_argument("--whosbotting-cache", type=str, default=None)
     parser.add_argument("--out-path", type=str)
     args = parser.parse_args()
 
@@ -416,6 +421,12 @@ def main():
 
     logging.critical(f"Collected {len(replay_ids)} deep replays.")
 
+    # Load cached whosbotting verdicts
+    whosbotting_cache_path = Path(args.whosbotting_cache) if args.whosbotting_cache else cache_dir / "whosbotting.jsonl"
+    whosbotting_cache = load_whosbotting_cache(whosbotting_cache_path)
+    if whosbotting_cache:
+        logging.critical(f"Loaded {len(whosbotting_cache)} cached whosbotting verdicts from {whosbotting_cache_path}")
+
     # Download replays and filter out cheaters in a single pass
     cheater_replays = set()
     with tempfile.TemporaryDirectory() as tmp_dir_str:
@@ -435,19 +446,36 @@ def main():
             for replay_info in tqdm(to_include, desc=f"Downloading replays for mode {mode}"):
                 rid = replay_info["id"]
                 replay_path = mode_path / f"{rid}.replay"
-                if not replay_path.exists():
-                    tmp_path = tmp_dir / f"{rid}.replay"
-                    bc_api.download_replay(rid, tmp_path)  # Stream chunks directly to Path
-                    if has_cheater(tmp_path):
+
+                # Check if already cached as cheater
+                cached_is_cheater = check_cached_cheater(rid, cache=whosbotting_cache)
+                if cached_is_cheater is True:
+                    cheater_replays.add(rid)
+                    (mode_path / f"{rid}.replay").unlink(missing_ok=True)
+                    continue
+
+                # If already downloaded and known clean, nothing more to do
+                if replay_path.exists() and cached_is_cheater is False:
+                    continue
+
+                # If already on disk but not yet checked
+                if replay_path.exists():
+                    if has_cheater(replay_path, cache_path=whosbotting_cache_path, replay_id=rid, cache=whosbotting_cache):
+                        cheater_replays.add(rid)
+                        replay_path.unlink(missing_ok=True)
+                    continue
+
+                # Replay not yet downloaded: download to temp
+                tmp_path = tmp_dir / f"{rid}.replay"
+                bc_api.download_replay(rid, tmp_path)  # Stream chunks directly to Path
+                if cached_is_cheater is False:
+                    shutil.move(tmp_path, replay_path)
+                else:
+                    if has_cheater(tmp_path, cache_path=whosbotting_cache_path, replay_id=rid, cache=whosbotting_cache):
                         cheater_replays.add(rid)
                         tmp_path.unlink(missing_ok=True)
                         continue
                     shutil.move(tmp_path, replay_path)
-                else:
-                    if has_cheater(replay_path):
-                        cheater_replays.add(rid)
-                        replay_path.unlink(missing_ok=True)
-                        continue
 
     # Remove cheaters from the final selected replay set
     if cheater_replays:
@@ -464,7 +492,7 @@ def main():
     with shelve.open(shelf_path) as shelf:
         for mode in scores:
             to_include = list(rinfo for rinfo in scores[mode].values() if rinfo["id"] in replay_ids)
-            metadata_path = mode_path / "metadata.json" if False else (out_path / mode / "metadata.json")
+            metadata_path = out_path / mode / "metadata.json"
             with (open(metadata_path, "w") as f,
                   tqdm(to_include, desc=f"Creating metadata file for mode {mode}") as it):
                 for replay_info in it:
