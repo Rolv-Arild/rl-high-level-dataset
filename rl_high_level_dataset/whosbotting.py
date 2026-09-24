@@ -4,9 +4,10 @@ import os
 import time
 import warnings
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Set
 
 import requests
+from ballchasing.util import get_players, get_pid
 
 RATE_LIMIT_BYPASS_KEY = os.environ.get("RATE_LIMIT_BYPASS_KEY")
 if RATE_LIMIT_BYPASS_KEY is None:
@@ -24,6 +25,26 @@ WHOSBOTTING_PLATFORM_MAP = {
     "xbox": "xbox",
     "psynet": "psynet",
 }
+
+
+def load_cheater_accounts(cheaters_path: str | Path | os.PathLike) -> Set[str]:
+    """Loads a set of platform:id cheater account strings from a text file."""
+    path = Path(cheaters_path)
+    if not path.exists():
+        return set()
+    with open(path, "r", encoding="utf-8") as f:
+        return {line.strip() for line in f if line.strip() and not line.startswith("#")}
+
+
+def replay_has_known_cheater(replay: dict, cheater_accounts: Set[str]) -> bool:
+    """Checks whether any player in the replay is in the known cheater accounts set."""
+    if not cheater_accounts or not replay:
+        return False
+    for player in get_players(replay):
+        pid = get_pid(player)
+        if pid in cheater_accounts:
+            return True
+    return False
 
 
 def verdict_has_cheater(verdict: Optional[Dict[str, Any]], threshold: float = 0.5) -> bool:
@@ -70,11 +91,11 @@ def load_whosbotting_cache(cache_path: str | Path | os.PathLike) -> dict[str, di
 
 
 def save_whosbotting_cache_entry(
-    cache_path: str | Path | os.PathLike,
-    replay_id: str,
-    verdict: dict,
-    cache: Optional[dict[str, dict]] = None,
-    threshold: float = 0.5,
+        cache_path: str | Path | os.PathLike,
+        replay_id: str,
+        verdict: dict,
+        cache: Optional[dict[str, dict]] = None,
+        threshold: float = 0.5,
 ) -> None:
     """Appends/updates a cache entry for a replay in the cache file and memory dict."""
     cache_path = Path(cache_path)
@@ -109,10 +130,10 @@ def save_whosbotting_cache_entry(
 
 
 def check_cached_cheater(
-    replay_id: str,
-    cache_path: Optional[str | Path | os.PathLike] = None,
-    cache: Optional[dict[str, dict]] = None,
-    threshold: float = 0.5,
+        replay_id: str,
+        cache_path: Optional[str | Path | os.PathLike] = None,
+        cache: Optional[dict[str, dict]] = None,
+        threshold: float = 0.5,
 ) -> Optional[bool]:
     """
     Check if a replay ID has a known verdict in cache without requiring the replay file.
@@ -136,12 +157,12 @@ def check_cached_cheater(
 
 
 def send_to_whosbotting(
-    replay_path: str | Path | os.PathLike,
-    max_retries: int = 5,
-    timeout: float = 30.0,
-    cache_path: Optional[str | Path | os.PathLike] = None,
-    replay_id: Optional[str] = None,
-    cache: Optional[dict[str, dict]] = None,
+        replay_path: str | Path | os.PathLike,
+        max_retries: int = 5,
+        timeout: float = 30.0,
+        cache_path: Optional[str | Path | os.PathLike] = None,
+        replay_id: Optional[str] = None,
+        cache: Optional[dict[str, dict]] = None,
 ) -> Optional[dict]:
     """Sends a replay file to whosbotting.com for ML-based bot detection, checking and updating cache if configured."""
     cache_file = cache_path or os.environ.get("WHOSBOTTING_CACHE_FILE")
@@ -205,11 +226,11 @@ def send_to_whosbotting(
 
 
 def has_cheater(
-    replay_path: str | Path | os.PathLike,
-    cache_path: Optional[str | Path | os.PathLike] = None,
-    replay_id: Optional[str] = None,
-    cache: Optional[dict[str, dict]] = None,
-    threshold: float = 0.5,
+        replay_path: str | Path | os.PathLike,
+        cache_path: Optional[str | Path | os.PathLike] = None,
+        replay_id: Optional[str] = None,
+        cache: Optional[dict[str, dict]] = None,
+        threshold: float = 0.5,
 ) -> bool:
     """Checks whether a replay has a cheater, checking/updating cache."""
     rid = replay_id or Path(replay_path).stem

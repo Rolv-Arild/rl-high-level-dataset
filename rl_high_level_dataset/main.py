@@ -11,7 +11,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from pathlib import Path
-from typing import Iterator, Optional, Iterable
+from typing import Iterator, Optional, Iterable, Set
 
 import requests
 import ballchasing as bc
@@ -26,6 +26,8 @@ from rl_high_level_dataset.whosbotting import (
     has_cheater,
     load_whosbotting_cache,
     check_cached_cheater,
+    load_cheater_accounts,
+    replay_has_known_cheater,
 )
 
 REPLAYS_PER_SEASON = int(os.getenv("REPLAYS_PER_SEASON", "100_000_000"))
@@ -45,8 +47,12 @@ def filter_valid_replays(replays: Iterator[dict]) -> Iterator[dict]:
 
 
 def score_and_filter_replays(replays: Iterator[dict], player_scores: dict,
-                             threshold: float = 0.25) -> Iterator[tuple[dict, float]]:
+                             threshold: float = 0.25,
+                             cheater_accounts: Optional[Set[str]] = None) -> Iterator[tuple[dict, float]]:
     for replay in replays:
+        if cheater_accounts and replay_has_known_cheater(replay, cheater_accounts):
+            logging.debug(f"Skipping replay {replay.get('id')} due to known cheater account.")
+            continue
         players = get_players(replay)
         if not players:
             continue
@@ -99,114 +105,168 @@ def iterate_replays_cached(
                 line = line.strip()
                 if not line:
                     continue
-                replay = json.loads(line)
-                writer.write(f"{line}\n")
-                seen.add(replay["id"])
-                yield replay, True
+                writer.write(line + "\n")
+                r = json.loads(line)
+                seen.add(r["id"])
+                yield r, True
 
-    mode = "a" if (append and not overwrite and os.path.exists(working_path)) else "w"
-    with open(working_path, mode) as writer:
+    writer = open(working_path, "a")
+
+    try:
         for replay in replays:
-            rid = replay.get("id")
-            if rid and rid not in seen:
-                writer.write(f"{json.dumps(replay)}\n")
-                seen.add(rid)
+            if replay["id"] not in seen:
+                writer.write(json.dumps(replay) + "\n")
+                writer.flush()
+                seen.add(replay["id"])
                 yield replay, False
+    finally:
+        writer.close()
+        # Atomic rename of the temporary file to the target cache file
+        os.replace(working_path, cache_path)
 
-    # Atomically replace old cache with the completed working file
-    os.replace(working_path, cache_path)
 
-
-def shared_pipeline(
-        replays: Iterator[dict],
-        cache_path: str,
-        result_path: Optional[str] = None,
+def get_deep_replays(
+        bc_api: bc.Api,
+        replays: Iterable[str],
+        shelf_path: str,
+        workers: int = 4
 ) -> Iterator[dict]:
-    # If the processed result cache already exists, return from it directly without re-filtering
-    if result_path and os.path.exists(result_path):
-        replays_cached = iterate_replays_cached(iter([]), result_path)
-        for replay, _ in replays_cached:
-            yield replay
-        return
+    # We open the shelf initially to identify which replays are missing
+    with shelve.open(shelf_path) as shelf:
+        uncached_replays = [rid for rid in replays if rid not in shelf]
 
-    # First cache of raw results (reads from cache_path if present, else queries API)
-    raw_replays = iterate_replays_cached(replays, cache_path)
-    replays_stream = (replay for replay, from_cache in raw_replays)
-    # Make sure the replays are valid, sorted and unique
-    replays_stream = filter_valid_replays(replays_stream)
-    replays_stream = ensure_sorted(replays_stream, sort_dir=DEFAULT_SORT_DIR, sort_by=DEFAULT_SORT_BY)
-    replays_stream = deduplicate(replays_stream, check_dates=True)
-    # Second cache for results
-    if result_path:
-        result_replays = iterate_replays_cached(replays_stream, result_path)
-        replays_stream = (replay for replay, from_cache in result_replays)
-    yield from replays_stream
+    # Create an iterator over the uncached replays using tqdm to display progress
+    it = tqdm(
+        uncached_replays,
+        desc="Fetching uncached deep replays",
+        total=len(uncached_replays),
+        unit="replay"
+    )
+
+    def fetch_replay(replay_id: str) -> tuple[str, Optional[dict]]:
+        try:
+            return replay_id, bc_api.get_replay(replay_id)
+        except requests.HTTPError as e:
+            if e.response.status_code == 404:
+                return replay_id, None
+            raise
+
+    # Download missing replays concurrently and save them as they complete
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        for replay_id, replay in executor.map(fetch_replay, it):
+            if replay is not None:
+                # Open, write, and immediately close the shelf for each item to avoid corrupting it on exit
+                with shelve.open(shelf_path) as shelf:
+                    shelf[replay_id] = replay
+            it.set_postfix(dict(id=replay_id, rate_limits=bc_api.rate_limit_count))
+
+    # Finally, read and yield all the replays sequentially from the shelf
+    with shelve.open(shelf_path) as shelf:
+        for rid in replays:
+            if rid in shelf:
+                yield shelf[rid]
 
 
 def get_ranked_replays(bc_api: bc.Api, season: str, cache_dir: str):
-    ranked_replays = bc_api.get_replays(
-        playlist=bc.Playlist.RANKED,
+    cache_path = os.path.join(cache_dir, f"season_{season}", "ranked", "gc_plus.jsonl")
+    # If the processed result cache already exists, return from it directly without re-filtering
+    if os.path.exists(cache_path):
+        return (r for r, cached in iterate_replays_cached(None, cache_path))
+
+    # Otherwise, download new replays and append only valid standard replays to the cache
+    replays = bc_api.get_replays(
+        playlist=[
+            bc.Playlist.RANKED_DUELS,
+            bc.Playlist.RANKED_DOUBLES,
+            bc.Playlist.RANKED_STANDARD,
+        ],
+        season=season,
         min_rank=bc.Rank.GRAND_CHAMPION_1,  # Pros should never be below this, season reset would put them in GC
         sort_by=DEFAULT_SORT_BY,
         sort_dir=DEFAULT_SORT_DIR,
-        count=REPLAYS_PER_SEASON,
-        season=season
     )
-    ranked_cache_path = os.path.join(cache_dir, f"season_{season}", "ranked", f"gc_plus.jsonl")
-    ranked_result_path = ranked_cache_path.replace(".jsonl", "_results.jsonl")
-    ranked_replays = shared_pipeline(
-        ranked_replays,
-        ranked_cache_path,
-        ranked_result_path,
-    )
-    yield from ranked_replays
+    # Ensure replays are sorted according to default parameters
+    replays = ensure_sorted(replays, sort_by=DEFAULT_SORT_BY, sort_dir=DEFAULT_SORT_DIR)
+    replays = filter_valid_replays(replays)
+    # Deduplication across playlists
+    replays = deduplicate(replays)
+    # Replays are added to the cache on the fly as they are yielded
+    replays = (r for r, cached in iterate_replays_cached(replays, cache_path, append=True))
+    return replays
 
 
 def get_private_replays(bc_api: bc.Api, season: str, player_id: str, cache_dir: str):
-    private_replays = bc_api.get_replays(
-        playlist=[bc.Playlist.PRIVATE, bc.Playlist.OFFLINE],
+    platform, uid = player_id.split(":")
+    cache_path = os.path.join(cache_dir, f"season_{season}", "private", f"{platform}_{uid}.jsonl")
+    # If the processed result cache already exists, return from it directly without re-filtering
+    if os.path.exists(cache_path):
+        return (r for r, cached in iterate_replays_cached(None, cache_path))
+
+    # Otherwise, download new replays and append only valid standard replays to the cache
+    replays = bc_api.get_replays(
+        player_id=f"{platform}:{uid}",
+        season=season,
+        playlist=bc.Playlist.PRIVATE,
         sort_by=DEFAULT_SORT_BY,
         sort_dir=DEFAULT_SORT_DIR,
-        season=season,
-        count=REPLAYS_PER_SEASON,
-        player_id=player_id,
-        disable_prefetch=True,  # Prevent way too many request at once since we do this for each player
     )
-    clean_pid = player_id.replace(":", "_").replace("*", "x")
-    private_cache_path = os.path.join(cache_dir, f"season_{season}", "private", f"{clean_pid}.jsonl")
-    private_result_path = private_cache_path.replace(".jsonl", "_results.jsonl")
-    private_replays = shared_pipeline(
-        private_replays,
-        private_cache_path,
-        private_result_path,
-    )
-    yield from private_replays
+    replays = ensure_sorted(replays, sort_by=DEFAULT_SORT_BY, sort_dir=DEFAULT_SORT_DIR)
+    replays = filter_valid_replays(replays)
+    replays = (r for r, cached in iterate_replays_cached(replays, cache_path, append=True))
+    return replays
 
 
-def collect_replays(bc_api: bc.Api, cache_dir: str):
-    seasons = bc.Season.FREE_TO_PLAY[4:21]  # f5-f21
-    # Note that ballchasing.com has not updated seasons since f21.
-    # Since EAC was implemented right after, breaking auto-uploads.
-    # We intentionally do nothing to correct this, because scores from f22 onwards would be poor quality,
-    # and we'd rather share scores between f21 and later seasons.
-    # It won't include many ranked replays, but we can at least get private matches (i.e. RLCS)
-
-    for season in seasons:
-        logging.critical(f"Collecting replays for season {season}...")
+def collect_replays(bc_api: bc.Api, cache_dir: str, cheater_accounts: Optional[Set[str]] = None) -> Iterator[tuple[dict, float]]:
+    # In seasons f5-f8, player encounters are heavily biased towards early seasons because players were not registered on ballchasing yet.
+    # Therefore we do not collect private matches for these seasons, only ranked matches.
+    for season in [
+        # bc.Season.SEASON_1,
+        # bc.Season.SEASON_2,
+        # bc.Season.SEASON_3,
+        # bc.Season.SEASON_4,
+        # bc.Season.SEASON_5,
+        # bc.Season.SEASON_6,
+        # bc.Season.SEASON_7,
+        # bc.Season.SEASON_8,
+        # bc.Season.SEASON_9,
+        # bc.Season.SEASON_10,
+        # bc.Season.SEASON_11,
+        # bc.Season.SEASON_12,
+        # bc.Season.SEASON_13,
+        # bc.Season.SEASON_14,
+        bc.Season.SEASON_F1,
+        bc.Season.SEASON_F2,
+        bc.Season.SEASON_F3,
+        bc.Season.SEASON_F4,
+        bc.Season.SEASON_F5,
+        bc.Season.SEASON_F6,
+        bc.Season.SEASON_F7,
+        bc.Season.SEASON_F8,
+        bc.Season.SEASON_F9,
+        bc.Season.SEASON_F10,
+        bc.Season.SEASON_F11,
+        bc.Season.SEASON_F12,
+        bc.Season.SEASON_F13,
+        bc.Season.SEASON_F14,
+        bc.Season.SEASON_F15,
+        bc.Season.SEASON_F16,
+        bc.Season.SEASON_F17,
+        bc.Season.SEASON_F18,
+        bc.Season.SEASON_F19,
+        bc.Season.SEASON_F20,
+        bc.Season.SEASON_F21,
+    ]:
         counts = Counter()
-
-        # First, check if encounter stats are already calculated and cached for this season
         encounters_file = os.path.join(cache_dir, f"season_{season}", "ranked", "encounters.json")
         if os.path.exists(encounters_file):
-            logging.info(f"Loading cached encounter stats from {encounters_file}")
             with open(encounters_file, "r") as f:
-                encounters_data = json.load(f)
-            encounter_stats = {k: EncounterStats(**v) for k, v in encounters_data["encounters"].items()}
-            player_stats = {k: EncounterStats(**v) for k, v in encounters_data["players"].items()}
+                data = json.load(f)
+                encounter_stats = {k: EncounterStats(**v) for k, v in data["encounters"].items()}
+                player_stats = {k: EncounterStats(**v) for k, v in data["players"].items()}
         else:
+            # First pass to find all players who have played with pros in ranked
             ranked_replays = get_ranked_replays(bc_api, season, cache_dir)
-            encounter_stats, player_stats, player_infos = get_encounter_stats(ranked_replays)
-            os.makedirs(os.path.dirname(encounters_file), exist_ok=True)
+            encounter_stats, player_stats = get_encounter_stats(ranked_replays)
             with open(encounters_file, "w") as f:
                 json.dump({
                     "encounters": {k: asdict(v) for k, v in encounter_stats.items()},
@@ -219,6 +279,8 @@ def collect_replays(bc_api: bc.Api, cache_dir: str):
 
         player_scores = {}
         for pid in encounter_stats:
+            if cheater_accounts and pid in cheater_accounts:
+                continue
             encounters = encounter_stats[pid]
             own = player_stats[pid]
             others = encounters - own
@@ -232,7 +294,7 @@ def collect_replays(bc_api: bc.Api, cache_dir: str):
 
         # Second pass to get ranked replays. Should be cached now.
         ranked_replays = get_ranked_replays(bc_api, season, cache_dir)
-        ranked_replays = score_and_filter_replays(ranked_replays, player_scores)
+        ranked_replays = score_and_filter_replays(ranked_replays, player_scores, cheater_accounts=cheater_accounts)
         for replay, score in ranked_replays:
             logging.info(f"Accepted ranked replay {replay['id']} with score {score:.4f}")
             yield replay, score
@@ -250,7 +312,7 @@ def collect_replays(bc_api: bc.Api, cache_dir: str):
             sort_dir=DEFAULT_SORT_DIR,
         )
         private_replays = deduplicate(private_replays)  # Deduplication across all players
-        private_replays = score_and_filter_replays(private_replays, player_scores)
+        private_replays = score_and_filter_replays(private_replays, player_scores, cheater_accounts=cheater_accounts)
         for replay, score in private_replays:
             logging.info(f"Accepted private replay {replay['id']} with score {score:.4f}")
             yield replay, score
@@ -259,15 +321,25 @@ def collect_replays(bc_api: bc.Api, cache_dir: str):
                          f"({dict(counts.most_common())})")
 
 
-def collect_replay_scores(bc_api: bc.Api, cache_dir: str):
+def collect_replay_scores(bc_api: bc.Api, cache_dir: str, cheater_accounts: Optional[Set[str]] = None):
     # Collect replay scores
     scores_path = os.path.join(cache_dir, "scores.json")
     if os.path.exists(scores_path):
         with open(scores_path, "r") as f:
             scores = json.load(f)
+        if cheater_accounts:
+            removed_count = 0
+            for mode in list(scores.keys()):
+                for rid, rinfo in list(scores[mode].items()):
+                    replay_players = set(rinfo.get("players", []))
+                    if replay_players & cheater_accounts:
+                        del scores[mode][rid]
+                        removed_count += 1
+            if removed_count:
+                logging.critical(f"Filtered out {removed_count} cheater replays from cached scores.")
     else:
         scores = {}
-        replays = collect_replays(bc_api, cache_dir)
+        replays = collect_replays(bc_api, cache_dir, cheater_accounts=cheater_accounts)
         for replay, score in replays:
             players = get_players(replay)
             gameplay_duration = get_gameplay_duration(replay)
@@ -298,64 +370,12 @@ def select_replays(scores: dict) -> Iterator[str]:
     while True:
         mode = min(mode_scores, key=lambda k: mode_durations[k] / target_ratios[k])
         try:
-            idx = mode_indices[mode]
-            replay_info = mode_scores[mode][idx]
-            mode_indices[mode] += 1
+            replay = mode_scores[mode][mode_indices[mode]]
         except IndexError:
-            logging.info(f"No more replays available for mode {mode}. "
-                         f"Mode durations: {mode_durations}")
-            for m in mode_scores:
-                idx = mode_indices[m]
-                last_replays = [r["id"] for r in mode_scores[m][idx - 10:idx]]
-                logging.debug(f"Mode {m} has {len(mode_scores[m]) - idx} replays left. "
-                              f"Last 10 included replays: {last_replays}")
             break
-        mode_durations[mode] += replay_info["gameplay_duration"]
-        yield replay_info["id"]
-
-
-def get_deep_replays(bc_api: bc.Api, replays: Iterable[str | dict], shelf_path: str,
-                     workers: int = 3, batch_size: int = 200) -> Iterator[dict]:
-    with (ThreadPoolExecutor(max_workers=workers) as ex,
-          shelve.open(shelf_path) as cache):
-        futures = []
-        count_since_sync = 0
-        for replay in replays:
-            if isinstance(replay, str):
-                rid = replay
-            else:
-                rid = replay["id"]
-            if rid in cache:
-                logging.debug(f"Using cached deep replay {rid}")
-                yield cache[rid]
-                continue
-            f = ex.submit(bc_api.get_replay, rid)
-            futures.append(f)
-            while len(futures) >= batch_size:
-                try:
-                    res = futures.pop(0).result()
-                    cache[res["id"]] = res
-                    count_since_sync += 1
-                    if count_since_sync >= 100:
-                        cache.sync()
-                        count_since_sync = 0
-                    yield res
-                except (HTTPError, requests.RequestException) as e:
-                    logging.warning(f"Failed to fetch deep replay: {e}")
-                    continue
-        while futures:
-            try:
-                res = futures.pop(0).result()
-                cache[res["id"]] = res
-                count_since_sync += 1
-                if count_since_sync >= 100:
-                    cache.sync()
-                    count_since_sync = 0
-                yield res
-            except (HTTPError, requests.RequestException) as e:
-                logging.warning(f"Failed to fetch deep replay: {e}")
-                continue
-        cache.sync()
+        yield replay["id"]
+        mode_durations[mode] += replay["gameplay_duration"]
+        mode_indices[mode] += 1
 
 
 def main():
@@ -364,6 +384,9 @@ def main():
     parser.add_argument("--base-dir", type=str, default=os.path.join(cur_path, "..", "out", "high_level"))
     parser.add_argument("--cache-dir", type=str, default=None)
     parser.add_argument("--whosbotting-cache", type=str, default=None)
+    parser.add_argument("--enable-whosbotting", action="store_true", default=False,
+                        help="Enable ML-based bot detection via whosbotting.com (currently disabled by default)")
+    parser.add_argument("--cheaters-file", type=str, default=None)
     parser.add_argument("--out-path", type=str)
     args = parser.parse_args()
 
@@ -390,8 +413,14 @@ def main():
         datefmt="%Y-%m-%d %H:%M:%S"
     )
 
+    # Load known cheater accounts list (temporary workaround for whosbotting)
+    cheaters_file = Path(args.cheaters_file) if args.cheaters_file else Path(cur_path).parent / "cheaters.txt"
+    cheater_accounts = load_cheater_accounts(cheaters_file)
+    if cheater_accounts:
+        logging.critical(f"Loaded {len(cheater_accounts)} known cheater accounts from {cheaters_file}")
+
     logging.critical("Starting replay collection...")
-    scores = collect_replay_scores(bc_api, str(cache_dir))
+    scores = collect_replay_scores(bc_api, str(cache_dir), cheater_accounts=cheater_accounts)
     logging.critical("Scores calculated.")
     logging.info(f"Ballchasing rate limit stats after scoring: {bc_api.rate_limit_stats}")
 
@@ -411,6 +440,17 @@ def main():
 
     logging.info(f"Ballchasing rate limit stats after deep replays: {bc_api.rate_limit_stats}")
 
+    # Re-filter any deep replays containing known cheater accounts
+    if cheater_accounts:
+        with shelve.open(shelf_path) as shelf:
+            flagged = {
+                rid for rid in replay_ids
+                if rid in shelf and replay_has_known_cheater(shelf[rid], cheater_accounts)
+            }
+            if flagged:
+                logging.critical(f"Filtered out {len(flagged)} deep replays matching accounts in {cheaters_file}")
+                replay_ids -= flagged
+
     # New scores with valid replays, then rebalance
     scores = {
         mode: {rid: rinfo for rid, rinfo in mode_scores.items() if rid in replay_ids}
@@ -421,9 +461,9 @@ def main():
 
     logging.critical(f"Collected {len(replay_ids)} deep replays.")
 
-    # Load cached whosbotting verdicts
+    # Load cached whosbotting verdicts if file exists
     whosbotting_cache_path = Path(args.whosbotting_cache) if args.whosbotting_cache else cache_dir / "whosbotting.jsonl"
-    whosbotting_cache = load_whosbotting_cache(whosbotting_cache_path)
+    whosbotting_cache = load_whosbotting_cache(whosbotting_cache_path) if whosbotting_cache_path.exists() else {}
     if whosbotting_cache:
         logging.critical(f"Loaded {len(whosbotting_cache)} cached whosbotting verdicts from {whosbotting_cache_path}")
 
@@ -454,28 +494,23 @@ def main():
                     (mode_path / f"{rid}.replay").unlink(missing_ok=True)
                     continue
 
-                # If already downloaded and known clean, nothing more to do
-                if replay_path.exists() and cached_is_cheater is False:
-                    continue
-
-                # If already on disk but not yet checked
+                # If already on disk: keep clean, only send to whosbotting if explicitly enabled
                 if replay_path.exists():
-                    if has_cheater(replay_path, cache_path=whosbotting_cache_path, replay_id=rid, cache=whosbotting_cache):
-                        cheater_replays.add(rid)
-                        replay_path.unlink(missing_ok=True)
+                    if args.enable_whosbotting and cached_is_cheater is not False:
+                        if has_cheater(replay_path, cache_path=whosbotting_cache_path, replay_id=rid, cache=whosbotting_cache):
+                            cheater_replays.add(rid)
+                            replay_path.unlink(missing_ok=True)
                     continue
 
                 # Replay not yet downloaded: download to temp
                 tmp_path = tmp_dir / f"{rid}.replay"
                 bc_api.download_replay(rid, tmp_path)  # Stream chunks directly to Path
-                if cached_is_cheater is False:
-                    shutil.move(tmp_path, replay_path)
-                else:
+                if args.enable_whosbotting and cached_is_cheater is not False:
                     if has_cheater(tmp_path, cache_path=whosbotting_cache_path, replay_id=rid, cache=whosbotting_cache):
                         cheater_replays.add(rid)
                         tmp_path.unlink(missing_ok=True)
                         continue
-                    shutil.move(tmp_path, replay_path)
+                shutil.move(tmp_path, replay_path)
 
     # Remove cheaters from the final selected replay set
     if cheater_replays:
