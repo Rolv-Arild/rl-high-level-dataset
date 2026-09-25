@@ -2,6 +2,9 @@
 
 A pipeline and curated dataset of high-tier competitive Rocket League matches sourced from [ballchasing.com](https://ballchasing.com), designed for imitation learning, trajectory forecasting, and offline reinforcement learning.
 
+The complete dataset is hosted on Kaggle:  
+👉 **[High-Level Rocket League Replay Dataset on Kaggle](https://www.kaggle.com/datasets/rolvarild/high-level-rocket-league-replay-dataset)**
+
 Unlike raw public replay dumps, this dataset undergoes graph-based skill verification, anti-cheat screening, behavioral rate validation, and statistical distribution hypothesis testing to eliminate non-serious games, content-creator handicaps, mutators, and bot matches.
 
 ---
