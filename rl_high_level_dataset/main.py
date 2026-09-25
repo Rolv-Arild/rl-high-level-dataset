@@ -278,7 +278,7 @@ def collect_replays(bc_api: bc.Api, cache_dir: str, cheater_accounts: Optional[S
             else:
                 # First pass to find all players who have played with pros in ranked
                 ranked_replays = get_ranked_replays(bc_api, season, cache_dir)
-                encounter_stats, player_stats = get_encounter_stats(ranked_replays)
+                encounter_stats, player_stats, _ = get_encounter_stats(ranked_replays)
                 with open(encounters_file, "w") as f:
                     json.dump({
                         "encounters": {k: asdict(v) for k, v in encounter_stats.items()},
