@@ -32,8 +32,6 @@ from rl_high_level_dataset.whosbotting import (
 )
 
 REPLAYS_PER_SEASON = int(os.getenv("REPLAYS_PER_SEASON", "100_000_000"))
-DEFAULT_SORT_BY = bc.ReplaySortBy.REPLAY_DATE
-DEFAULT_SORT_DIR = bc.SortDir.ASCENDING
 
 
 def filter_valid_replays(replays: Iterator[dict]) -> Iterator[dict]:
@@ -77,7 +75,7 @@ def score_and_filter_replays(replays: Iterator[dict], player_scores: dict,
 
 
 def iterate_replays_cached(
-        replays: Iterator[dict],
+        replays: Optional[Iterator[dict]],
         cache_path: str,
         overwrite: bool = False,
         append: bool = False,
@@ -98,123 +96,79 @@ def iterate_replays_cached(
     if cache_dir:
         os.makedirs(cache_dir, exist_ok=True)
 
+    mode = "a+" if append and not overwrite else "w"
     seen = set()
-    # If appending to an existing cache, copy existing entries to working file first
-    if append and not overwrite and os.path.exists(cache_path):
-        with open(cache_path, "r") as reader, open(working_path, "w") as writer:
-            for line in reader:
+    with open(working_path, mode) as writer:
+        if mode == "a+":
+            # Read the existing cache and yield it
+            writer.seek(0)
+            for line in writer:
                 line = line.strip()
                 if not line:
                     continue
-                writer.write(line + "\n")
-                r = json.loads(line)
-                seen.add(r["id"])
-                yield r, True
-
-    writer = open(working_path, "a")
-
-    try:
-        for replay in replays:
-            if replay["id"] not in seen:
-                writer.write(json.dumps(replay) + "\n")
-                writer.flush()
+                replay = json.loads(line)
+                yield replay, True
                 seen.add(replay["id"])
-                yield replay, False
-    finally:
-        writer.close()
-        # Atomic rename of the temporary file to the target cache file
-        os.replace(working_path, cache_path)
+
+        # Now write the new incoming replays
+        if replays is not None:
+            for replay in replays:
+                if replay["id"] not in seen:
+                    writer.write(f"{json.dumps(replay)}\n")
+                    seen.add(replay["id"])
+                    yield replay, False
+
+    # Atomically replace the old cache with the new working file
+    if os.path.exists(cache_path):
+        os.remove(cache_path)
+    os.rename(working_path, cache_path)
 
 
-def get_deep_replays(
-        bc_api: bc.Api,
-        replays: Iterable[str],
-        shelf_path: str,
-        workers: int = 4
-) -> Iterator[dict]:
-    # We open the shelf initially to identify which replays are missing
-    with shelve.open(shelf_path) as shelf:
-        uncached_replays = [rid for rid in replays if rid not in shelf]
-
-    # Create an iterator over the uncached replays using tqdm to display progress
-    it = tqdm(
-        uncached_replays,
-        desc="Fetching uncached deep replays",
-        total=len(uncached_replays),
-        unit="replay"
-    )
-
-    def fetch_replay(replay_id: str) -> tuple[str, Optional[dict]]:
-        try:
-            return replay_id, bc_api.get_replay(replay_id)
-        except requests.HTTPError as e:
-            if e.response.status_code == 404:
-                return replay_id, None
-            raise
-
-    # Download missing replays concurrently and save them as they complete
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        for replay_id, replay in executor.map(fetch_replay, it):
-            if replay is not None:
-                # Open, write, and immediately close the shelf for each item to avoid corrupting it on exit
-                with shelve.open(shelf_path) as shelf:
-                    shelf[replay_id] = replay
-            it.set_postfix(dict(id=replay_id, rate_limits=bc_api.rate_limit_count))
-
-    # Finally, read and yield all the replays sequentially from the shelf
-    with shelve.open(shelf_path) as shelf:
-        for rid in replays:
-            if rid in shelf:
-                yield shelf[rid]
+def shared_pipeline(replays: Iterator[dict], cache_path: str, result_path: Optional[str] = None) -> Iterator[dict]:
+    # First cache of raw results
+    replays = iterate_replays_cached(replays, cache_path)
+    replays = (replay for replay, from_cache in replays)
+    # Make sure the replays are valid, sorted and unique
+    replays = filter_valid_replays(replays)
+    replays = ensure_sorted(replays, sort_dir=bc.SortDir.ASCENDING, sort_by=bc.ReplaySortBy.REPLAY_DATE)
+    replays = deduplicate(replays, check_dates=True)
+    # Second cache for results
+    if result_path:
+        replays = iterate_replays_cached(replays, result_path)
+        replays = (replay for replay, from_cache in replays)
+    yield from replays
 
 
 def get_ranked_replays(bc_api: bc.Api, season: str, cache_dir: str):
-    cache_path = os.path.join(cache_dir, f"season_{season}", "ranked", "gc_plus.jsonl")
-    # If the processed result cache already exists, return from it directly without re-filtering
-    if os.path.exists(cache_path):
-        return (r for r, cached in iterate_replays_cached(None, cache_path))
-
-    # Otherwise, download new replays and append only valid standard replays to the cache
-    replays = bc_api.get_replays(
-        playlist=[
-            bc.Playlist.RANKED_DUELS,
-            bc.Playlist.RANKED_DOUBLES,
-            bc.Playlist.RANKED_STANDARD,
-        ],
-        season=season,
+    ranked_replays = bc_api.get_replays(
+        playlist=bc.Playlist.RANKED,
         min_rank=bc.Rank.GRAND_CHAMPION_1,  # Pros should never be below this, season reset would put them in GC
-        sort_by=DEFAULT_SORT_BY,
-        sort_dir=DEFAULT_SORT_DIR,
+        sort_by=bc.ReplaySortBy.REPLAY_DATE,
+        sort_dir=bc.SortDir.ASCENDING,
+        count=REPLAYS_PER_SEASON,
+        season=season,
     )
-    # Ensure replays are sorted according to default parameters
-    replays = ensure_sorted(replays, sort_by=DEFAULT_SORT_BY, sort_dir=DEFAULT_SORT_DIR)
-    replays = filter_valid_replays(replays)
-    # Deduplication across playlists
-    replays = deduplicate(replays)
-    # Replays are added to the cache on the fly as they are yielded
-    replays = (r for r, cached in iterate_replays_cached(replays, cache_path, append=True))
-    return replays
+    ranked_cache_path = os.path.join(cache_dir, f"season_{season}", "ranked", "gc_plus.jsonl")
+    ranked_result_path = ranked_cache_path.replace(".jsonl", "_results.jsonl")
+    ranked_replays = shared_pipeline(ranked_replays, ranked_cache_path, ranked_result_path)
+    yield from ranked_replays
 
 
 def get_private_replays(bc_api: bc.Api, season: str, player_id: str, cache_dir: str):
-    platform, uid = player_id.split(":")
-    cache_path = os.path.join(cache_dir, f"season_{season}", "private", f"{platform}_{uid}.jsonl")
-    # If the processed result cache already exists, return from it directly without re-filtering
-    if os.path.exists(cache_path):
-        return (r for r, cached in iterate_replays_cached(None, cache_path))
-
-    # Otherwise, download new replays and append only valid standard replays to the cache
-    replays = bc_api.get_replays(
-        player_id=f"{platform}:{uid}",
+    private_replays = bc_api.get_replays(
+        playlist=[bc.Playlist.PRIVATE, bc.Playlist.OFFLINE],
+        sort_by=bc.ReplaySortBy.REPLAY_DATE,
+        sort_dir=bc.SortDir.ASCENDING,
         season=season,
-        playlist=bc.Playlist.PRIVATE,
-        sort_by=DEFAULT_SORT_BY,
-        sort_dir=DEFAULT_SORT_DIR,
+        count=REPLAYS_PER_SEASON,
+        player_id=player_id,
+        disable_prefetch=True,  # Prevent way too many requests at once since we do this for each player
     )
-    replays = ensure_sorted(replays, sort_by=DEFAULT_SORT_BY, sort_dir=DEFAULT_SORT_DIR)
-    replays = filter_valid_replays(replays)
-    replays = (r for r, cached in iterate_replays_cached(replays, cache_path, append=True))
-    return replays
+    clean_pid = player_id.replace(":", "_").replace("*", "x")
+    private_cache_path = os.path.join(cache_dir, f"season_{season}", "private", f"{clean_pid}.jsonl")
+    private_result_path = private_cache_path.replace(".jsonl", "_results.jsonl")
+    private_replays = shared_pipeline(private_replays, private_cache_path, private_result_path)
+    yield from private_replays
 
 
 def get_qualified_player_scores(
@@ -273,12 +227,13 @@ def collect_replays(bc_api: bc.Api, cache_dir: str, cheater_accounts: Optional[S
             if os.path.exists(encounters_file):
                 with open(encounters_file, "r") as f:
                     data = json.load(f)
-                    encounter_stats = {k: EncounterStats(**v) for k, v in data["encounters"].items()}
-                    player_stats = {k: EncounterStats(**v) for k, v in data["players"].items()}
+                encounter_stats = {k: EncounterStats(**v) for k, v in data["encounters"].items()}
+                player_stats = {k: EncounterStats(**v) for k, v in data["players"].items()}
             else:
                 # First pass to find all players who have played with pros in ranked
                 ranked_replays = get_ranked_replays(bc_api, season, cache_dir)
                 encounter_stats, player_stats, _ = get_encounter_stats(ranked_replays)
+                os.makedirs(os.path.dirname(encounters_file), exist_ok=True)
                 with open(encounters_file, "w") as f:
                     json.dump({
                         "encounters": {k: asdict(v) for k, v in encounter_stats.items()},
@@ -303,14 +258,13 @@ def collect_replays(bc_api: bc.Api, cache_dir: str, cheater_accounts: Optional[S
 
         # Get valid private replays for all the qualified players
         player_iterators = {}
-        for qualified_player in player_scores.items():
-            pid, score = qualified_player
+        for pid in player_scores:
             private_replays = get_private_replays(bc_api, season, pid, cache_dir)
             player_iterators[pid] = private_replays
         private_replays = mix_replay_iterators(
             *player_iterators.values(),
-            sort_by=DEFAULT_SORT_BY,
-            sort_dir=DEFAULT_SORT_DIR,
+            sort_by=bc.ReplaySortBy.REPLAY_DATE,
+            sort_dir=bc.SortDir.ASCENDING,
         )
         private_replays = deduplicate(private_replays)  # Deduplication across all players
         private_replays = score_and_filter_replays(private_replays, player_scores, cheater_accounts=cheater_accounts)
@@ -328,6 +282,7 @@ def collect_replay_scores(bc_api: bc.Api, cache_dir: str, cheater_accounts: Opti
     if os.path.exists(scores_path):
         with open(scores_path, "r") as f:
             scores = json.load(f)
+        scores = {mode: data for mode, data in scores.items() if mode in ("1v1", "2v2", "3v3")}
         if cheater_accounts:
             removed_count = 0
             for mode in list(scores.keys()):
@@ -345,6 +300,8 @@ def collect_replay_scores(bc_api: bc.Api, cache_dir: str, cheater_accounts: Opti
             players = get_players(replay)
             gameplay_duration = get_gameplay_duration(replay)
             mode = f"{len(players) // 2}v{len(players) // 2}"
+            if mode not in ("1v1", "2v2", "3v3"):
+                continue
             rid = replay["id"]
             scores.setdefault(mode, {})[rid] = {
                 "id": rid,
@@ -368,15 +325,66 @@ def select_replays(scores: dict) -> Iterator[str]:
         mode_durations[mode] = 0
         mode_indices[mode] = 0
         target_ratios[mode] = 1
+        # target_ratios[mode] = int(mode[0]) + 1  # e.g., "2v2" -> 3
     while True:
         mode = min(mode_scores, key=lambda k: mode_durations[k] / target_ratios[k])
         try:
-            replay = mode_scores[mode][mode_indices[mode]]
+            idx = mode_indices[mode]
+            replay_info = mode_scores[mode][idx]
+            mode_indices[mode] += 1
         except IndexError:
+            logging.info(f"No more replays available for mode {mode}. "
+                         f"Mode durations: {mode_durations}")
+            for m in mode_scores:
+                idx = mode_indices[m]
+                last_replays = [r["id"] for r in mode_scores[m][idx - 10:idx]]
+                logging.debug(f"Mode {m} has {len(mode_scores[m]) - idx} replays left. "
+                              f"Last 10 included replays: {last_replays}")
             break
-        yield replay["id"]
-        mode_durations[mode] += replay["gameplay_duration"]
-        mode_indices[mode] += 1
+        mode_durations[mode] += replay_info["gameplay_duration"]  # * len(replay_info["players"])
+        yield replay_info["id"]
+
+
+def get_deep_replays(
+        bc_api: bc.Api,
+        replays: Iterable[str],
+        shelf_path: str,
+        workers: int = 4
+) -> Iterator[dict]:
+    # Open the shelf initially to identify which replays are missing
+    with shelve.open(shelf_path) as shelf:
+        uncached_replays = [rid for rid in replays if rid not in shelf]
+
+    # Create an iterator over the uncached replays using tqdm to display progress
+    it = tqdm(
+        uncached_replays,
+        desc="Fetching uncached deep replays",
+        total=len(uncached_replays),
+        unit="replay"
+    )
+
+    def fetch_replay(replay_id: str) -> tuple[str, Optional[dict]]:
+        try:
+            return replay_id, bc_api.get_replay(replay_id)
+        except requests.HTTPError as e:
+            if e.response.status_code == 404:
+                return replay_id, None
+            raise
+
+    # Download missing replays concurrently and save them as they complete
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        for replay_id, replay in executor.map(fetch_replay, it):
+            if replay is not None:
+                # Open, write, and immediately close the shelf for each item to avoid corrupting it on exit
+                with shelve.open(shelf_path) as shelf:
+                    shelf[replay_id] = replay
+            it.set_postfix(dict(id=replay_id, rate_limits=bc_api.rate_limit_count))
+
+    # Finally, read and yield all the replays sequentially from the shelf
+    with shelve.open(shelf_path) as shelf:
+        for rid in replays:
+            if rid in shelf:
+                yield shelf[rid]
 
 
 def main():
@@ -530,12 +538,24 @@ def main():
                         continue
                 shutil.move(tmp_path, replay_path)
 
-    # Remove cheaters from the final selected replay set
+    # Remove cheaters from the final selected replay set and re-balance
     if cheater_replays:
         logging.critical(f"Filtered out {len(cheater_replays)} cheater replays.")
         replay_ids -= cheater_replays
+        scores = {
+            mode: {rid: rinfo for rid, rinfo in mode_scores.items() if rid in replay_ids}
+            for mode, mode_scores in scores.items()
+        }
+        selected_replays = list(select_replays(scores))
+        replay_ids = set(selected_replays)
 
     downloaded_replays = set(out_path.glob("*/*.replay"))
+    # Clean up any downloaded replays that were dropped in re-balancing
+    for rpath in list(downloaded_replays):
+        if rpath.stem not in replay_ids:
+            rpath.unlink(missing_ok=True)
+            downloaded_replays.remove(rpath)
+
     assert len(downloaded_replays) == len(replay_ids), (
         f"Mismatch between downloaded replays ({len(downloaded_replays)}) and selected IDs ({len(replay_ids)})!"
     )
