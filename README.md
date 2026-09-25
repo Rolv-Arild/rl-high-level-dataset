@@ -24,7 +24,7 @@ Modes are balanced by **active gameplay clock time** (excluding kickoff countdow
 
 ## Collection Strategy
 
-1. **Ranked Discovery**: Collect GC+ ranked replays across modern free-to-play seasons (S4 to S19).
+1. **Ranked Discovery**: Collect GC+ ranked replays across modern free-to-play seasons (S5 to S23).
 2. **Skill Scoring**: In ranked 2v2, score players based on how often they encounter verified Supersonic Legends (SSL) and Liquipedia-tagged professionals.
 3. **Private & Tournament Scrims**: Include private and off-ladder replays featuring players with qualifying skill scores.
 4. **Anti-Cheat & Bot Pruning**: Filter against known RLGym/injection botting accounts (Nexto, Element) and banlists (`cheaters.txt` and `whosbotting`).

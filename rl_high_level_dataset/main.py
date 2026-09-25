@@ -217,81 +217,81 @@ def get_private_replays(bc_api: bc.Api, season: str, player_id: str, cache_dir: 
     return replays
 
 
+def get_qualified_player_scores(
+        encounter_stats: dict[str, EncounterStats],
+        player_stats: dict[str, EncounterStats],
+        or_threshold: float = 0.5,
+        and_threshold: float = 0.1,
+        cheater_accounts: Optional[Set[str]] = None,
+) -> dict[str, EncounterStats]:
+    """Calculates qualified player scores given encounter and self stats."""
+    player_scores = {}
+    for pid in encounter_stats:
+        if cheater_accounts and pid in cheater_accounts:
+            continue
+        encounters = encounter_stats[pid]
+        own = player_stats.get(pid, EncounterStats())
+        others = encounters - own
+        prob_pro_and_ssl = others.prob_pro * others.prob_ssl
+        prob_pro_or_ssl = others.prob_pro + others.prob_ssl - prob_pro_and_ssl
+        if encounters.pro_count > 0 and own.ssl_count > 0:
+            if prob_pro_or_ssl > or_threshold and prob_pro_and_ssl > and_threshold:
+                player_scores[pid] = others
+    return player_scores
+
+
 def collect_replays(bc_api: bc.Api, cache_dir: str, cheater_accounts: Optional[Set[str]] = None) -> Iterator[tuple[dict, float]]:
-    # In seasons f5-f8, player encounters are heavily biased towards early seasons because players were not registered on ballchasing yet.
-    # Therefore we do not collect private matches for these seasons, only ranked matches.
-    for season in [
-        # bc.Season.SEASON_1,
-        # bc.Season.SEASON_2,
-        # bc.Season.SEASON_3,
-        # bc.Season.SEASON_4,
-        # bc.Season.SEASON_5,
-        # bc.Season.SEASON_6,
-        # bc.Season.SEASON_7,
-        # bc.Season.SEASON_8,
-        # bc.Season.SEASON_9,
-        # bc.Season.SEASON_10,
-        # bc.Season.SEASON_11,
-        # bc.Season.SEASON_12,
-        # bc.Season.SEASON_13,
-        # bc.Season.SEASON_14,
-        bc.Season.SEASON_F1,
-        bc.Season.SEASON_F2,
-        bc.Season.SEASON_F3,
-        bc.Season.SEASON_F4,
-        bc.Season.SEASON_F5,
-        bc.Season.SEASON_F6,
-        bc.Season.SEASON_F7,
-        bc.Season.SEASON_F8,
-        bc.Season.SEASON_F9,
-        bc.Season.SEASON_F10,
-        bc.Season.SEASON_F11,
-        bc.Season.SEASON_F12,
-        bc.Season.SEASON_F13,
-        bc.Season.SEASON_F14,
-        bc.Season.SEASON_F15,
-        bc.Season.SEASON_F16,
-        bc.Season.SEASON_F17,
-        bc.Season.SEASON_F18,
-        bc.Season.SEASON_F19,
-        bc.Season.SEASON_F20,
-        bc.Season.SEASON_F21,
-    ]:
+    # Free-to-play seasons to collect: f5 through f23
+    seasons = [f"f{i}" for i in range(5, 24)]
+    # Note on post-f21 seasons (f22, f23, ...):
+    # EAC was implemented after Season 21, breaking BakkesMod rank reporting and auto-uploading.
+    # Consequently, ranked replays from f22 onwards lack rank tags and cannot form a valid encounter graph.
+    # We explicitly reuse Season 21 player scores for all post-f21 seasons.
+    f21_scores: Optional[dict[str, EncounterStats]] = None
+
+    for season in seasons:
+        logging.critical(f"Collecting replays for season {season}...")
         counts = Counter()
-        encounters_file = os.path.join(cache_dir, f"season_{season}", "ranked", "encounters.json")
-        if os.path.exists(encounters_file):
-            with open(encounters_file, "r") as f:
-                data = json.load(f)
-                encounter_stats = {k: EncounterStats(**v) for k, v in data["encounters"].items()}
-                player_stats = {k: EncounterStats(**v) for k, v in data["players"].items()}
+
+        season_num = int(season.lstrip("f"))
+        if season_num > 21:
+            # Explicitly reuse Season 21 player scores for post-f21 replays
+            if f21_scores is None:
+                f21_encounters_file = os.path.join(cache_dir, "season_f21", "ranked", "encounters.json")
+                if os.path.exists(f21_encounters_file):
+                    with open(f21_encounters_file, "r") as f:
+                        data = json.load(f)
+                    enc_stats = {k: EncounterStats(**v) for k, v in data["encounters"].items()}
+                    p_stats = {k: EncounterStats(**v) for k, v in data["players"].items()}
+                    f21_scores = get_qualified_player_scores(enc_stats, p_stats, cheater_accounts=cheater_accounts)
+                else:
+                    raise RuntimeError("Cannot score post-f21 season without completed season_f21 cache!")
+            player_scores = f21_scores
+            logging.critical(f"Using Season f21 scores ({len(player_scores)} qualified players) for post-f21 season {season}.")
         else:
-            # First pass to find all players who have played with pros in ranked
-            ranked_replays = get_ranked_replays(bc_api, season, cache_dir)
-            encounter_stats, player_stats = get_encounter_stats(ranked_replays)
-            with open(encounters_file, "w") as f:
-                json.dump({
-                    "encounters": {k: asdict(v) for k, v in encounter_stats.items()},
-                    "players": {k: asdict(v) for k, v in player_stats.items()},
-                }, f, indent=2)
+            encounters_file = os.path.join(cache_dir, f"season_{season}", "ranked", "encounters.json")
+            if os.path.exists(encounters_file):
+                with open(encounters_file, "r") as f:
+                    data = json.load(f)
+                    encounter_stats = {k: EncounterStats(**v) for k, v in data["encounters"].items()}
+                    player_stats = {k: EncounterStats(**v) for k, v in data["players"].items()}
+            else:
+                # First pass to find all players who have played with pros in ranked
+                ranked_replays = get_ranked_replays(bc_api, season, cache_dir)
+                encounter_stats, player_stats = get_encounter_stats(ranked_replays)
+                with open(encounters_file, "w") as f:
+                    json.dump({
+                        "encounters": {k: asdict(v) for k, v in encounter_stats.items()},
+                        "players": {k: asdict(v) for k, v in player_stats.items()},
+                    }, f, indent=2)
 
-        # Every player must have at least these probabilities to ever be included
-        or_threshold = 0.5  # of being pro OR ssl
-        and_threshold = 0.1  # of being pro AND ssl
+            player_scores = get_qualified_player_scores(
+                encounter_stats, player_stats, cheater_accounts=cheater_accounts
+            )
+            logging.critical(f"Qualified {len(player_scores)} players for season {season}.")
 
-        player_scores = {}
-        for pid in encounter_stats:
-            if cheater_accounts and pid in cheater_accounts:
-                continue
-            encounters = encounter_stats[pid]
-            own = player_stats[pid]
-            others = encounters - own
-            prob_pro_and_ssl = others.prob_pro * others.prob_ssl
-            prob_pro_or_ssl = others.prob_pro + others.prob_ssl - prob_pro_and_ssl
-            if encounters.pro_count > 0 and own.ssl_count > 0:
-                if prob_pro_or_ssl > or_threshold:  # Qualification threshold
-                    if prob_pro_and_ssl > and_threshold:
-                        player_scores[pid] = others
-        logging.critical(f"Qualified {len(player_scores)} players for season {season}.")
+            if season == "f21":
+                f21_scores = player_scores
 
         # Second pass to get ranked replays. Should be cached now.
         ranked_replays = get_ranked_replays(bc_api, season, cache_dir)
