@@ -1,4 +1,4 @@
-# High-Level Competitive Rocket League Dataset
+# High-Level Rocket League Replay Dataset
 
 A pipeline and curated dataset of high-tier competitive Rocket League matches sourced from [ballchasing.com](https://ballchasing.com), designed for imitation learning, trajectory forecasting, and offline reinforcement learning.
 
