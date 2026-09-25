@@ -21,6 +21,7 @@ from requests import HTTPError
 from requests.adapters import HTTPAdapter
 from tqdm import tqdm
 
+from rl_high_level_dataset.anomaly import is_anomalous_replay
 from rl_high_level_dataset.encounters import get_encounter_stats, EncounterStats
 from rl_high_level_dataset.whosbotting import (
     has_cheater,
@@ -387,6 +388,8 @@ def main():
     parser.add_argument("--enable-whosbotting", action="store_true", default=False,
                         help="Enable ML-based bot detection via whosbotting.com (currently disabled by default)")
     parser.add_argument("--cheaters-file", type=str, default=None)
+    parser.add_argument("--disable-anomaly-filter", action="store_true", default=False,
+                        help="Disable statistical and behavioral anomaly filtering for non-serious / AFK matches.")
     parser.add_argument("--out-path", type=str)
     args = parser.parse_args()
 
@@ -450,6 +453,21 @@ def main():
             if flagged:
                 logging.critical(f"Filtered out {len(flagged)} deep replays matching accounts in {cheaters_file}")
                 replay_ids -= flagged
+
+    # Filter out anomalous replays (AFK, freestyle, non-serious, mutator lobbies)
+    if not args.disable_anomaly_filter:
+        with shelve.open(shelf_path) as shelf:
+            anomalous = set()
+            for mode, mode_scores in scores.items():
+                for rid in mode_scores:
+                    if rid in replay_ids and rid in shelf:
+                        is_anom, reasons = is_anomalous_replay(shelf[rid], mode=mode)
+                        if is_anom:
+                            anomalous.add(rid)
+                            logging.debug(f"Filtered anomalous replay {rid}: {reasons}")
+            if anomalous:
+                logging.critical(f"Filtered out {len(anomalous)} anomalous replays across modes.")
+                replay_ids -= anomalous
 
     # New scores with valid replays, then rebalance
     scores = {
